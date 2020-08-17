@@ -193,62 +193,124 @@ plt.title("The final weight vector is: ({},{})".format(round(wcourse[-1,0],3),
 ###############################################################################
 ###############################################################################
 from time import time
+from tqdm import tqdm
 import numpy as np
 from random import sample
+import networkx as nx
+import matplotlib.pyplot as plt
+import sys
+sys.path.append('/nfs/s2/userhome/zhangyiyuan/workingdir/package/')
 import brian2 as b2
 from brian2.monitors import StateMonitor, SpikeMonitor, PopulationRateMonitor
 from neurodynex3.tools import plot_tools, spike_tools
 
-def poisson_generator(n_neuron, rate, t):
-    return np.random.poisson(rate, (n_neuron,t))
 
+# Arguments
 N_input = 1000
-N_recurrent = 4096
+N_recurrent = 100
 v_rest = -70 * b2.mV
 v_reset = -65 * b2.mV
 firing_threshold = -50 * b2.mV
 membrane_time_scale = 8. * b2.ms
 abs_refractory_period = 2.0 * b2.ms
 synaptic_delay = 1.5 * b2.ms
+taupre = taupost = 20*b2.ms
+wmax = 1*b2.mV
+Apre = 0.01*b2.mV
+Apost = -Apre*taupre/taupost*1.05
+simulation_time = 20*b2.ms
 Poisson_rate = np.random.rand(N_input)*1000
+
 W = np.random.randn(N_input,N_recurrent)
 M = np.random.randn(N_recurrent,N_recurrent)
 
-start_time = time()
+Graph = nx.random_graphs.barabasi_albert_graph(N_recurrent,10)
+M = np.zeros((N_recurrent,N_recurrent))
+for (u,v,d) in tqdm(Graph.edges(data=True)):
+    M[u,v] = np.random.randn()
+
+# Data
+Data = np.load('/Users/mac/Desktop/TDCNN/Results/Alexnet_fc8_SOM/Data.npy')
+Data = np.where(Data>=0, Data, 0)
+data = (Data[0]-Data[0].min())/(Data[0].max()-Data[0].min())
+
+
+
 b2.start_scope()
 
 # G
 eqs = """dv/dt = -(v-v_rest) / membrane_time_scale : volt (unless refractory)"""
 G = b2.NeuronGroup(N_recurrent, model=eqs, reset="v=v_reset", threshold="v>firing_threshold",
                    refractory=abs_refractory_period, method="linear")
-G.v = v_rest  # set initial value
-S_recurrnet = b2.Synapses(G, G, model='w : volt', on_pre='v_post += w', delay=synaptic_delay)
+G.v = v_rest  # set initial value        
+S_recurrnet = b2.Synapses(G, G,
+                         '''w : volt
+                         dapre/dt = -apre/taupre : volt (clock-driven)
+                         dapost/dt = -apost/taupost : volt (clock-driven)''',
+                         on_pre='''v_post += w
+                         apre += Apre
+                         w = clip(w+apost, 0, wmax)''',
+                         on_post='''apost += Apost
+                         w = clip(w+apre, 0, wmax)''', 
+                         delay=synaptic_delay,
+                         method='linear')
 S_recurrnet.connect()
 for i in range(N_recurrent):
     for j in range(N_recurrent):
         S_recurrnet.w[i,j] = M[i,j]*b2.mV
         
+        
 # P
-P = b2.PoissonGroup(N_input, rates=Poisson_rate*b2.Hz)
-S_feedforward = b2.Synapses(P, G, model='w : volt', on_pre='v_post += w', delay=synaptic_delay)
+P = b2.PoissonGroup(N_input, rates=1000*data*b2.Hz)
+S_feedforward = b2.Synapses(P, G,
+                         '''w : volt
+                         dapre/dt = -apre/taupre : volt (clock-driven)
+                         dapost/dt = -apost/taupost : volt (clock-driven)''',
+                         on_pre='''v_post += w
+                         apre += Apre
+                         w = clip(w+apost, 0, wmax)''',
+                         on_post='''apost += Apost
+                         w = clip(w+apre, 0, wmax)''', 
+                         delay=synaptic_delay,
+                         method='linear')
 S_feedforward.connect()
 for i in range(N_input):
     for j in range(N_recurrent):
         S_feedforward.w[i,j] = W[i,j]*b2.mV
+        
 
 # monitorss and run
-idx_monitored_neurons = sample(range(N_recurrent), 3)
+idx_monitored_neurons = sample(range(N_recurrent), 5)
 rate_monitor = PopulationRateMonitor(G)
 spike_monitor = SpikeMonitor(G, record=True)
 voltage_monitor = StateMonitor(G, "v", record=True)
-b2.run(100*b2.ms)
-end_time = time()
-print('Cost time is:', end_time-start_time)
+for times in range(5):
+    start_time = time()
+    b2.run(simulation_time)
+    end_time = time()
+    print('Cost time is:', end_time-start_time)
+    
+    # synapse pruning
+    S_recurrnet.w = np.where(S_recurrnet.w/b2.uvolt>np.percentile(S_recurrnet.w/b2.uvolt,60), S_recurrnet.w/b2.uvolt, 0)*b2.mV
+    S_feedforward.w = np.where(S_feedforward.w/b2.uvolt>np.percentile(S_feedforward.w/b2.uvolt,60), S_feedforward.w/b2.uvolt, 0)*b2.mV
 
 
 # plot
 plot_tools.plot_network_activity(rate_monitor, spike_monitor, voltage_monitor, spike_train_idx_list=idx_monitored_neurons, t_min=0.*b2.ms)
-spike_stats = spike_tools.get_spike_train_stats(spike_monitor, window_t_min= 100 *b2.ms)
+spike_stats = spike_tools.get_spike_train_stats(spike_monitor, window_t_min=simulation_time)
+plt.show()
+
+
+
+plt.figure()
+plt.ion()     # 开启一个画图的窗口
+voltage = voltage_monitor.get_states()['v']/b2.mvolt
+for i in range(voltage.shape[0]):
+    plt.imshow(voltage[i,:].reshape(10,10), 'jet')
+    plt.title('This is time: %d' %i)
+    plt.axis('off')
+    plt.pause(0.000000000000000001)       # 停顿时间
+plt.pause(0)   # 防止运行结束时闪退
 
 
 
